@@ -71,5 +71,6 @@ cython_debug/
 ._*
 
 src/depth_routing/token_evolution_data
+token_evolution_data/
 results/
 runs/
