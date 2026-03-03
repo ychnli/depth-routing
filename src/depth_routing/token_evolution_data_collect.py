@@ -25,7 +25,7 @@ DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 PROMPT_LEN = 64
 MIN_TOTAL_LEN = 100
 BATCH_SIZE = 4
-OUTPUT_DIR = "token_evolution_data"
+OUTPUT_DIR = "token_evolution_data" 
 MAX_SEQ_LEN = 512
 
 EXCERPT_FIELDS = [
@@ -65,7 +65,7 @@ def is_valid(text):
     return True
 
 def passes_length_filter(text, tokenizer, min_tokens=MIN_TOTAL_LEN):
-    """Return True if the tokenised text meets the minimum token count."""
+    """Return True if the tokenized text meets the minimum token count."""
     tokens = tokenizer(text)["input_ids"]
     return len(tokens) >= min_tokens
 
@@ -263,6 +263,7 @@ def load_excerpts(
     """
     if excerpt_ids is None:
         excerpt_ids = list_excerpt_ids(output_dir)
+        print(excerpt_ids)
     return [load_excerpt(output_dir, eid) for eid in excerpt_ids]
 
 
@@ -751,6 +752,7 @@ if __name__ == "__main__":
                         help="Print per-excerpt progress output")
     parser.add_argument("--small-run", action="store_true",
                         help="Use a small subset of the data for quick testing")
+
     args = parser.parse_args()
 
     device = args.device or DEVICE
@@ -782,3 +784,5 @@ if __name__ == "__main__":
         save_hidden_states=args.save_hidden_states,
         enable_generation=args.generation,
     )
+    # excerpt_out = load_excerpts("token_evolution_data_NEW")
+    # print(excerpt_out[0])
