@@ -134,6 +134,30 @@ print(f"  unembedding shape: {U.shape}  dtype: {U.dtype}")
 
 del model   # no longer needed
 
+import inspect
+from tuned_lens.nn.lenses import TunedLens
+from tuned_lens.nn import unembed   # may or may not exist
+
+# The core forward pass
+print("=== TunedLens.forward ===")
+print(inspect.getsource(TunedLens.forward))
+
+print("\n=== TunedLens.transform_hidden ===")
+print(inspect.getsource(TunedLens.transform_hidden))
+
+# The unembed step — try both possible locations
+try:
+    print("\n=== TunedLens.unembed (method) ===")
+    print(inspect.getsource(tuned_lens.unembed.__class__))
+except Exception as e:
+    print(f"Not a class: {e}")
+
+# Also show the full class structure
+print("\n=== TunedLens class members ===")
+print([m for m in dir(TunedLens) if not m.startswith('__')])
+
+print("STOPSTOPSTOPSOTP")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2.  Helper functions — all operate in float16

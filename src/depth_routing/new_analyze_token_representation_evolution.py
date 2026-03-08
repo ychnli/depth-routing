@@ -228,6 +228,16 @@ for k in range(3):
     ax = fig.add_axes([left, bot_panel, PANEL_IN / FIG_W, PANEL_IN / FIG_H])
     axes.append(ax)
 
+def format_cosine(v):
+    if v >= 1.0:
+        return "1"
+    elif v <= -1.0:
+        return "-1"
+    elif v < 0:
+        return f"{v:.2f}"[0] + f"{v:.2f}"[2:]
+    else:
+        return f".{v:.2f}"[2:]
+    
 # ── Draw heatmaps ─────────────────────────────────────────────────────────────
 for ax, mat, lbl, cnt in zip(axes, avg_mats, labels, counts):
     display = mat.copy()
@@ -249,7 +259,8 @@ for ax, mat, lbl, cnt in zip(axes, avg_mats, labels, counts):
                 continue
             brightness = (v - vmin) / (vmax - vmin + 1e-9)
             tcol = "white" if brightness > 0.60 else "#12122a"
-            label = "1" if v >= 1.0 else f"{v:.2f}"[1:]
+            # label = "1" if v >= 1.0 else f"{v:.2f}"[1:]
+            label = format_cosine(v)
             ax.text(c, r, label,
                     ha="center", va="center",
                     fontsize=ann_fs, color=tcol)
