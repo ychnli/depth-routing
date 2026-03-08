@@ -100,7 +100,8 @@ logger = logging.getLogger(__name__)
 MODEL_NAME    = "EleutherAI/pythia-160m-deduped"
 DEVICE        = "mps" if torch.backends.mps.is_available() else "cpu"
 PROMPT_LEN    = 64
-MIN_TOTAL_LEN = 100
+# MIN_TOTAL_LEN = 100
+MIN_TOTAL_LEN = 32
 BATCH_SIZE    = 4
 OUTPUT_DIR    = "token_evolution_data"
 MAX_SEQ_LEN   = 512
@@ -215,15 +216,23 @@ def compute_tuned_lens_data(
     targets_th = torch.as_tensor(targets, device=device, dtype=torch.long)
     pos_idx    = torch.arange(seq_len, device=device)
 
-    # Final-layer model log-probs — reference distribution for KL divergence
-    model_lp = model_logits.squeeze(0).log_softmax(-1)   # (seq_len, V)
+    # Reference distribution for KL divergence — TunedLens applied to the final
+    # hidden state.  We use this instead of model_logits (the padded-batch output)
+    # because TunedLens uses deep-copied weights and processes the unpadded sample,
+    # so small float differences would give nonzero KL at l=L-1 if we used
+    # model_logits.  Using tuned_lens.forward(hidden_states[-1], L-1) guarantees
+    # KL=0 at the final layer by construction.
+    with torch.no_grad():
+        final_tl_logits = tuned_lens.forward(hidden_states[-1], L - 1)
+    model_lp = final_tl_logits.squeeze(0).log_softmax(-1)   # (seq_len, V)
     model_p  = model_lp.exp()
 
     all_ce:      list[np.ndarray] = []
     all_ent:     list[np.ndarray] = []
     all_fkl:     list[np.ndarray] = []
     all_top:     list[np.ndarray] = []
-    all_proj_ln: list[np.ndarray] = []   # (seq_len, hidden_dim) per layer
+    all_proj_ln: list[np.ndarray] = []    # (seq_len, hidden_dim) per layer
+    all_lp:      list[torch.Tensor] = []  # (seq_len, V) per layer — for adjacent KL
 
     with torch.no_grad():
         for l, h in enumerate(hidden_states):
@@ -250,6 +259,17 @@ def compute_tuned_lens_data(
             all_fkl.append(((model_p * (model_lp - lp)).sum(-1)).cpu().float().numpy())
             all_top.append(lp.argmax(-1).cpu().numpy().astype(np.int32))
             all_proj_ln.append(h_ln.squeeze(0).cpu().float().numpy())   # (seq_len, hidden_dim)
+            all_lp.append(lp.cpu().float())                              # (seq_len, V) — kept for adjacent KL
+
+    # Adjacent-layer KL: KL(layer l || layer l+1) for l = 0 … L-2.
+    # Measures how much the predicted distribution changes between consecutive
+    # layers.  Shape: (L-1, seq_len).  KL(p||q) = sum(p * (log_p - log_q)).
+    all_adj_kl: list[np.ndarray] = []
+    for l in range(L - 1):
+        lp_l   = all_lp[l]       # (seq_len, V) float32
+        lp_lp1 = all_lp[l + 1]   # (seq_len, V) float32
+        adj_kl = (lp_l.exp() * (lp_l - lp_lp1)).sum(-1)   # (seq_len,)
+        all_adj_kl.append(adj_kl.numpy())
 
     # Stack: (L, seq_len, hidden_dim) float32
     proj_ln_np = np.stack(all_proj_ln, axis=0)
@@ -270,13 +290,14 @@ def compute_tuned_lens_data(
         cossim_vocab_list.append(cosine_sim_matrix(logits_j))
 
     return {
-        "cross_entropy":  np.array(all_ce,  dtype=np.float16),         # (L, seq_len)
-        "entropy":        np.array(all_ent, dtype=np.float16),         # (L, seq_len)
-        "forward_kl":     np.array(all_fkl, dtype=np.float16),         # (L, seq_len)
-        "top_token_ids":  np.array(all_top, dtype=np.int32),           # (L, seq_len)
-        "proj_ln_states": proj_ln_np.astype(np.float16),               # (L, seq_len, hidden_dim)
-        "cossim_hidden":  np.stack(cossim_hidden_list, axis=0),        # (seq_len, L, L)
-        "cossim_vocab":   np.stack(cossim_vocab_list,  axis=0),        # (seq_len, L, L)
+        "cross_entropy":  np.array(all_ce,      dtype=np.float16),        # (L, seq_len)
+        "entropy":        np.array(all_ent,     dtype=np.float16),        # (L, seq_len)
+        "forward_kl":     np.array(all_fkl,     dtype=np.float16),        # (L, seq_len)
+        "adjacent_kl":    np.array(all_adj_kl,  dtype=np.float16),        # (L-1, seq_len)
+        "top_token_ids":  np.array(all_top,     dtype=np.int32),          # (L, seq_len)
+        "proj_ln_states": proj_ln_np.astype(np.float16),                  # (L, seq_len, hidden_dim)
+        "cossim_hidden":  np.stack(cossim_hidden_list, axis=0),           # (seq_len, L, L)
+        "cossim_vocab":   np.stack(cossim_vocab_list,  axis=0),           # (seq_len, L, L)
     }
 
 
@@ -410,6 +431,36 @@ def run_sanity_check(
             f"SANITY CHECK FAILED (excerpt {excerpt_id}): "
             f"cossim_hidden max error {max_cossim_err:.6f} > 0.002. "
             "Cosine similarities are inconsistent with stored proj_ln_states."
+        )
+
+    # ── Check 5: final-layer KL is exactly zero ───────────────────────────────
+    # tl_forward_kl[L-1, j] measures KL between TunedLens at layer L-1 and
+    # itself (the reference distribution).  This must be exactly 0.
+    final_kl     = tl_data["forward_kl"][L - 1].astype(np.float32)   # (seq_len,)
+    max_final_kl = float(np.max(np.abs(final_kl)))
+    print(f"    Check 5 — final-layer KL max |val|:  {max_final_kl:.6f}  (expected 0.000000)")
+
+    if max_final_kl > 1e-3:
+        raise RuntimeError(
+            f"SANITY CHECK FAILED (excerpt {excerpt_id}): "
+            f"final-layer KL max value {max_final_kl:.6f} > 0.001. "
+            "tl_forward_kl[L-1] should be exactly zero — the reference "
+            "distribution is TunedLens at layer L-1 compared to itself."
+        )
+
+    # ── Check 6: adjacent_kl non-negativity ──────────────────────────────────
+    # KL divergence is always >= 0 by definition.  We cannot re-derive
+    # adjacent_kl from stored proj_ln_states because those are float16 and the
+    # log-softmax over a 50k vocab accumulates enough rounding error to exceed
+    # any reasonable tolerance.  Non-negativity is the meaningful invariant.
+    adj_kl_np  = tl_data["adjacent_kl"].astype(np.float32)   # (L-1, seq_len)
+    min_adj_kl = float(adj_kl_np.min())
+    print(f"    Check 6  — adjacent_kl min value:     {min_adj_kl:.6f}  (expected >= 0)")
+    if min_adj_kl < -1e-3:
+        raise RuntimeError(
+            f"SANITY CHECK FAILED (excerpt {excerpt_id}): "
+            f"adjacent_kl min value {min_adj_kl:.6f} < -0.001. "
+            "KL divergence must be non-negative."
         )
 
     print("    ✓ All sanity checks passed.")
@@ -700,6 +751,7 @@ def collect_token_evolution_data(
                 excerpt_data["tl_cross_entropy"]  = tl_data["cross_entropy"][:, :n]
                 excerpt_data["tl_entropy"]        = tl_data["entropy"][:, :n]
                 excerpt_data["tl_forward_kl"]     = tl_data["forward_kl"][:, :n]
+                excerpt_data["tl_adjacent_kl"]    = tl_data["adjacent_kl"][:, :n]  # (L-1, n)
                 excerpt_data["tl_top_token_ids"]  = tl_data["top_token_ids"][:, :n]
                 excerpt_data["tl_proj_ln_states"] = tl_data["proj_ln_states"][:, :n, :]
                 excerpt_data["tl_cossim_hidden"]  = tl_data["cossim_hidden"][:n]
@@ -802,19 +854,6 @@ def collect_token_evolution_data(
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-
-    # import numpy as np
-
-    # d = np.load("NEW_DATA_TEST/excerpts/excerpt_0000.npz", allow_pickle=True)
-
-    # # See everything that was saved
-    # print(list(d.files))
-
-    # # Check shapes and dtypes
-    # for k in d.files:
-    #     v = d[k]
-    #     print(f"{k:25s}  shape={str(v.shape):25s}  dtype={v.dtype}")
-
     import argparse
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -846,7 +885,8 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     dataset   = load_dataset(args.dataset, args.dataset_config, split=args.split)
 
-    texts = [x["text"] for x in dataset if is_valid(x["text"])]
+# texts = [x["text"] for x in dataset if is_valid(x["text"])]
+    texts = [x["text"] for x in dataset]
     texts = [t for t in texts if passes_length_filter(t, tokenizer, args.min_total_len)]
     if args.max_seq_len:
         texts = [

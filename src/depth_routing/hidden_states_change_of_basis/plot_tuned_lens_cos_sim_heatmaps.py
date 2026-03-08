@@ -11,7 +11,7 @@ but with representations projected into the final layer's basis first.
 
 Usage
 -----
-  python plot_tuned_lens_cosine.py \\
+  python plot_tuned_lens_cos_sim_heatmaps.py \\
       --data-file  tuned_lens_projections/tuned_lens_cossims.npz \\
       --output-dir tuned_lens_figures
 """
