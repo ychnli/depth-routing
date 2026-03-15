@@ -17,7 +17,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error, r2_score
-from transformers import AutoTokenizer
 
 # ── Config ──────────────────────────────────────────────────────────────────────
 MODEL_NAME = "EleutherAI/pythia-160m-deduped"
@@ -33,8 +32,6 @@ ARTIFACTS_DIR = Path(__file__).parent / "affine_map_artifacts"
 CATEGORIES = ["by_0", "never"]
 
 REQUIRED_KEYS = {"hidden_states", "tl_top_token_ids", "token_losses", "input_ids"}
-
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
 
 # ── Data structures ─────────────────────────────────────────────────────────────
@@ -113,11 +110,12 @@ def collect_all_tokens(category: str) -> UpdateDataset:
         raise FileNotFoundError(f"No excerpt_*.npz files in {EXCERPT_DIR}")
 
     all_states, all_token_ids = [], []
+    n_tokens = 0
     print(f"[collect] category={category!r} | scanning {len(excerpt_files)} files")
 
     for i, fpath in enumerate(excerpt_files, 1):
-        if i % 100 == 0:
-            print(f"  processed {i}/{len(excerpt_files)} files, {len(all_states):,} tokens so far")
+        if i % 20 == 0:
+            print(f"  processed {i}/{len(excerpt_files)} files, {n_tokens:,} tokens so far")
 
         batch = load_excerpt(fpath)
         # Drop last position to align with next-token target
@@ -134,12 +132,27 @@ def collect_all_tokens(category: str) -> UpdateDataset:
         idx = np.flatnonzero(mask)
         all_states.append(states[idx])
         all_token_ids.append(token_ids[idx])
+        n_tokens += len(idx)
 
     states_arr = np.concatenate(all_states).astype(np.float32)
     token_ids_arr = np.concatenate(all_token_ids)
     print(f"[collect] {category}: {len(states_arr):,} tokens, shape={states_arr.shape}")
 
     return UpdateDataset(category=category, states=states_arr, token_ids=token_ids_arr)
+
+
+# ── Class balancing ────────────────────────────────────────────────────────────
+def subsample_dataset(dataset: UpdateDataset, n: int, seed: int) -> UpdateDataset:
+    """Randomly sample exactly n tokens from dataset (without replacement)."""
+    if n > len(dataset.states):
+        raise ValueError(f"Requested {n} samples but dataset only has {len(dataset.states)}")
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(len(dataset.states), size=n, replace=False)
+    return UpdateDataset(
+        category=dataset.category,
+        states=dataset.states[idx],
+        token_ids=dataset.token_ids[idx],
+    )
 
 
 # ── Cross-validated fitting ─────────────────────────────────────────────────────
@@ -236,9 +249,8 @@ def aggregate_metrics(metrics: list[LayerFoldMetrics]) -> dict[str, np.ndarray]:
 
 
 # ── Plotting ────────────────────────────────────────────────────────────────────
-# Palette: teal for easy, coral for hard
-COLOR_BY0 = "#2a9d8f"
-COLOR_NEVER = "#e76f51"
+COLOR_BY0 = "#4D779E"    
+COLOR_NEVER = "#825095"  
 
 
 def plot_comparison(by0_agg: dict, never_agg: dict, save_path: Path) -> None:
@@ -293,9 +305,19 @@ def plot_comparison(by0_agg: dict, never_agg: dict, save_path: Path) -> None:
 
 # ── Main ────────────────────────────────────────────────────────────────────────
 def main() -> None:
+    # Collect full datasets first so we know the minority class size
+    datasets = {cat: collect_all_tokens(cat) for cat in CATEGORIES}
+
+    # Balance: subsample majority class (never) to match minority class (by_0)
+    n_min = min(len(ds.states) for ds in datasets.values())
+    minority = min(datasets, key=lambda c: len(datasets[c].states))
+    print(f"[balance] minority class is '{minority}' with {n_min:,} tokens — "
+          f"subsampling all categories to {n_min:,}")
+    datasets = {cat: subsample_dataset(ds, n_min, RNG_SEED) for cat, ds in datasets.items()}
+
     results = {}
     for cat in CATEGORIES:
-        dataset = collect_all_tokens(cat)
+        dataset = datasets[cat]
         metrics = fit_cv(dataset)
         csv_path = ARTIFACTS_DIR / cat / "cv_metrics.csv"
         write_metrics_csv(metrics, csv_path)
