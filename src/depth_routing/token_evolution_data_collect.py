@@ -23,7 +23,7 @@ MODEL_NAME = "EleutherAI/pythia-160m-deduped"
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 
 PROMPT_LEN = 64
-MIN_TOTAL_LEN = 100
+MIN_TOTAL_LEN = 32
 BATCH_SIZE = 4
 OUTPUT_DIR = "token_evolution_data" 
 MAX_SEQ_LEN = 512
@@ -96,9 +96,9 @@ def _compute_tuned_lens_metrics(tuned_lens, hidden_states, model_logits, targets
     Returns
     -------
     dict
-        ``cross_entropy``  — ``(n_layers+1, seq_len)`` float16
-        ``entropy``        — ``(n_layers+1, seq_len)`` float16
-        ``forward_kl``     — ``(n_layers+1, seq_len)`` float16
+        ``cross_entropy``  — ``(n_layers+1, seq_len)`` float32
+        ``entropy``        — ``(n_layers+1, seq_len)`` float32
+        ``forward_kl``     — ``(n_layers+1, seq_len)`` float32
         ``top_token_ids``  — ``(n_layers+1, seq_len)`` int32
     """
     device = model_logits.device
@@ -122,7 +122,7 @@ def _compute_tuned_lens_metrics(tuned_lens, hidden_states, model_logits, targets
         all_fkl.append(((model_p * (model_lp - lp)).sum(-1)).detach().cpu().float().numpy())
         all_top.append(lp.argmax(-1).detach().cpu().numpy())
 
-        del lp, p  # free accelerator memory
+        del lp, p  # free memory
 
     # Final layer (true model predictions)
     all_ce.append((-model_lp[pos_idx, targets_th]).detach().cpu().float().numpy())
@@ -131,9 +131,9 @@ def _compute_tuned_lens_metrics(tuned_lens, hidden_states, model_logits, targets
     all_top.append(model_logits.squeeze(0).argmax(-1).detach().cpu().numpy())
 
     return {
-        "cross_entropy": np.array(all_ce, dtype=np.float16),
-        "entropy": np.array(all_ent, dtype=np.float16),
-        "forward_kl": np.array(all_fkl, dtype=np.float16),
+        "cross_entropy": np.array(all_ce, dtype=np.float32),
+        "entropy": np.array(all_ent, dtype=np.float32),
+        "forward_kl": np.array(all_fkl, dtype=np.float32),
         "top_token_ids": np.array(all_top, dtype=np.int32),
     }
 
@@ -427,7 +427,7 @@ def collect_token_evolution_data(
         ``.npz`` file and can be loaded via
         :func:`load_tuned_lens_from_excerpts`.
     save_hidden_states :
-        If True, include raw per-layer hidden states (float16) in each
+        If True, include raw per-layer hidden states (float32) in each
         per-excerpt ``.npz`` file.  Disabled by default because hidden states
         are large (``n_layers × seq_len × hidden_dim × 2`` bytes each).
     enable_generation :
@@ -565,7 +565,7 @@ def collect_token_evolution_data(
         for i in range(cur_batch_size):
             actual_len = seq_lens[i]
 
-            # ---- Build the per-excerpt data dict ---------------------------
+            # Build the per-excerpt data dict
             ids_np = input_ids[i, :actual_len].cpu().numpy().astype(np.int64)
             tok_strs = np.array(
                 [tokenizer.decode([int(tid)]) for tid in ids_np], dtype=object,
@@ -587,16 +587,15 @@ def collect_token_evolution_data(
                 "forward_pass_ms": forward_ms,
             }
 
-            # ---- Hidden states (optional — stored as float16) --------------
+            # Hidden states (optional)
             if save_hidden_states:
                 hs = torch.stack(
                     [h[i, :actual_len, :] for h in hidden_states]
-                ).cpu().half().numpy()   # (n_layers+1, seq_len, hidden_dim)
+                ).cpu().float().numpy()   # (n_layers+1, seq_len, hidden_dim)
                 excerpt_data["hidden_states"] = hs
 
-            # ---- TunedLens trajectory (optional) ---------------------------
             if tuned_lens is not None:
-                # Next-token targets (same convention as tuned_lens_analysis)
+                # Next-token targets
                 target_ids = input_ids[i, 1:actual_len].cpu().tolist()
                 target_ids.append(tokenizer.eos_token_id or 0)
 
@@ -612,14 +611,12 @@ def collect_token_evolution_data(
                     n = tl_metrics["cross_entropy"].shape[0]
                     tl_layer_labels = [f"layer_{j}" for j in range(n - 1)] + ["output"]
 
-                # Store in per-excerpt data (prefixed with tl_)
                 excerpt_data["layer_labels"] = np.array(tl_layer_labels)
                 excerpt_data["tl_cross_entropy"] = tl_metrics["cross_entropy"]
                 excerpt_data["tl_entropy"] = tl_metrics["entropy"]
                 excerpt_data["tl_forward_kl"] = tl_metrics["forward_kl"]
                 excerpt_data["tl_top_token_ids"] = tl_metrics["top_token_ids"]
 
-            # ---- Generation and BERTScore (optional) -----------------------
             generated_text = None
             bertscore = None
             generation_ms = 0.0
@@ -676,10 +673,10 @@ def collect_token_evolution_data(
                 excerpt_data["tokens_generated"] = tokens_generated
                 excerpt_data["tokens_per_sec"] = tokens_per_sec
 
-            # ---- Save per-excerpt .npz (primary format) --------------------
+            # save per-excerpt .npz
             save_excerpt(output_dir, excerpt_id, excerpt_data)
 
-            # ---- Append lightweight summary row to CSV ---------------------
+            # append lightweight summary row to CSV 
             pd.DataFrame([{
                 "excerpt_id": excerpt_id,
                 "prompt": batch_prompt_texts[i],
